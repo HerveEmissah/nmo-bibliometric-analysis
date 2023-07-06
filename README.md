@@ -1,2 +1,4 @@
 # nmo-bibliometric-analysis
- Back-end implementation of a containerized research tool for searching and analyzing the literature citations to peer-reviewed publications describing neural morphology reconstructions.
+Back-end API for Bibliometric Analysis of NMO Describing, Citing and Using Literature. </br></br>
+#To build and run the container: </br> 
+docker-compose up -d --build </br></br>
