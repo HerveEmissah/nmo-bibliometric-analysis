@@ -1,0 +1,14 @@
+Flask >= 1.1.1,<1.2
+Flask-Cors >= 3.0.8
+Flask-PyMongo >= 2.3.0
+Flask-Mail >= 0.9.1
+pymongo >= 3.10.1
+DateTime >= 4.3
+urllib3 >= 1.25.9
+urlopen >= 1.0.0
+asyncio >= 3.4.3
+collections2 >= 0.3.0
+mechanize >= 0.4.5
+math22 >= 2.2
+openpyxl >= 3.0.3
+pycel >= 1.0b22
