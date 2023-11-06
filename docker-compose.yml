@@ -5,6 +5,7 @@ web:
     - "5050:5000"
   volumes:
     - .:/nmo
+    - ./tables_dump:/nmo/tables_dump
   links:
     - db            
 db:
