@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, request, json, url_for, Response, render_template
+from flask import Flask, jsonify, request, json, url_for, Response, render_template, abort, make_response
 from flask_pymongo import PyMongo
 from flask_mail import Mail, Message
 import pymongo
@@ -25,6 +25,11 @@ import urllib.parse
 from urllib.parse import urlencode
 import datetime
 from itsdangerous import URLSafeSerializer, BadData
+import re
+import requests
+import subprocess
+import sshtunnel
+from sshtunnel import SSHTunnelForwarder
 
 app = Flask(__name__)
 
@@ -47,6 +52,30 @@ app.config.update(
 )
 
 mail = Mail(app)
+
+# Configuration for the MySQL database
+db_config = {
+    'host': 'LoggingData',
+    'user': 'blxps',
+    'password': '100%db',
+    'db_name': 'LoggingData'
+}
+
+# Configuration for the SSH tunnel to the remote server
+ssh_config = {
+    'ssh_address': ('129.174.130.34', 22),
+    'ssh_username': 'herve1',
+    'ssh_password': 'herve123',
+    'remote_bind_address': ('localhost', 3306),  # Assuming MySQL uses default port
+}
+
+dump_file_path = '/nmo/tables_dump'
+
+
+#create directory with write permissions (in octal notation, 0o755 allows owner to read/write/execute, others to read/execute)
+if not os.path.exists(dump_file_path):
+    os.makedirs(dump_file_path, mode=0o755)
+
 
 @app.route('/users/neuromorphodata', methods=["POST"])
 def neuromorphodata():
@@ -1723,9 +1752,8 @@ def Trigger_EmailAlert_NMODescribingCitedBy_NMOs():
 
     return response
 
-
 @app.route('/users/webhook', methods=["GET"])
-def webhook():
+def webhook():  #Webhook service for monthly update of lit release and neuron downloads
 
     response = Response(status=200)
 
@@ -1757,6 +1785,28 @@ def webhook():
     Trigger_EmailAlert_NMODescribingCitedBy_NMOs()
     webhook_log('Trigger_EmailAlert_NMODescribingCitedBy_NMOs() completed')
 
+    #Import table dump of neuron_article & logdownload    
+    res1 = import_neuron_article_dump()
+    if res1.status_code == 200:
+        #webhook_log('import_neuron_article_dump completed')
+        res2 = import_logdownload_dump()
+        if res2.status_code == 200:
+            #webhook_log('import logdownload_dump completed')
+            res3 = article_neuron_dowload()
+            if res3.status_code == 200:
+                #webhook_log('article_neuron_dowload completed')
+                res4 = number_of_downloads_per_article()
+                if res4.status_code == 200:
+                    #webhook_log('number_of_downloads_per_article completed')
+                    res5 = NMODescribing_All_CitedBy_NMO_With_Downloads()
+                    if res5.status_code == 200:
+                        #webhook_log('NMODescribing_All_CitedBy_NMO_With_Downloads completed')
+                        res6 = NMO_DescribingCited_With_Downloads()
+                        if res6.status_code == 200:
+                            #webhook_log('NMO_DescribingCited_With_Downloads completed')
+                            webhook_log('Import of neuron_article & logdownload to MongoDB completed')
+
+
     return response
 
 
@@ -1769,6 +1819,7 @@ def webhook_log(msg_body):
 
     msg.body = msg_body
     mail.send(msg)
+
 
     email2 = 'ascoli@gmu.edu'
     msg = Message("NMO webhook log",
@@ -1857,7 +1908,6 @@ def DBCollectionsBackup():
     docs5.close()
 
     return response
-
 
 
 @app.route('/users/DBCollectionsRestore', methods=["POST"])
@@ -2588,8 +2638,10 @@ def NMODescribingCitedList():
     source = request.values.get('source')
     res = []
     if source == "europepmc":
-        NMO_DescribingCited = db.NMO_DescribingCited
-        docs = NMO_DescribingCited.find()
+        #NMO_DescribingCited = db.NMO_DescribingCited
+        #docs = NMO_DescribingCited.find()
+        NMO_DescribingCited_With_Downloads = db.NMO_DescribingCited_With_Downloads
+        docs = NMO_DescribingCited_With_Downloads.find()
         for doc in docs:
             doc['_id'] = str(doc['_id'])
             res.append(doc)
@@ -2702,14 +2754,16 @@ def NMODescribing_Overall_CitedByNMO_ByID():
 
     res = []
     if source == "europepmc":
-        NMODescribing_Overall_CitedByNMO = db.NMODescribing_Overall_CitedByNMO
+        #NMODescribing_Overall_CitedByNMO = db.NMODescribing_Overall_CitedByNMO
+        NMODescribing_Overall_CitedByNMO_With_Downloads = db.NMODescribing_Overall_CitedByNMO_With_Downloads
         doc = None
         fullurl=None
         if pmid != None:
-            doc = NMODescribing_Overall_CitedByNMO.find_one({'pmid': pmid})
+            doc = NMODescribing_Overall_CitedByNMO_With_Downloads.find_one({'pmid': pmid})
             if doc != None:
                 res = ({'pmid': doc['pmid'], 'doi': doc['doi'], 'citedBy': doc['citedBy'], 'title': doc['title'],
-                       'publishedDate': doc['publishedDate'], 'total_NMO_Citations': doc['total_NMO_Citations']})
+                       'publishedDate': doc['publishedDate'], 'total_NMO_Citations': doc['total_NMO_Citations'],
+                       'Number_of_Downloads': doc['Number_of_Downloads'], 'Avg_Downloads_Per_Cell': doc['Avg_Downloads_Per_Cell']})
         elif doi != None:
            fullurl = request.url
 
@@ -2725,10 +2779,12 @@ def NMODescribing_Overall_CitedByNMO_ByID():
            querydoi = doi.replace('&', chr(38))
            filter={'doi': querydoi}
 
-           doc = NMODescribing_Overall_CitedByNMO.find(filter=filter)
+           doc = NMODescribing_Overall_CitedByNMO_With_Downloads.find(filter=filter)
            for elem in doc:
                res = ({'pmid': elem['pmid'], 'doi': elem['doi'], 'citedBy': elem['citedBy'], 'title': elem['title'], 
-                       'publishedDate': elem['publishedDate'], 'total_NMO_Citations': elem['total_NMO_Citations']})
+                       'publishedDate': elem['publishedDate'], 'total_NMO_Citations': elem['total_NMO_Citations'],
+                       'Number_of_Downloads': elem['Number_of_Downloads'], 'Avg_Downloads_Per_Cell': elem['Avg_Downloads_Per_Cell']})
+
 
     return json.dumps(res)
 
@@ -2758,6 +2814,289 @@ def NMODescribing_CitedBy_NMOs_SinceUpload_ByID():
                     'years_since_upload': doc['years_since_upload'], 'relative_percent_years_since_upload': doc['relative_percent_years_since_upload']})
 
     return json.dumps(res)
+
+
+@app.route('/users/import_neuron_article_dump', methods=['POST'])
+def import_neuron_article_dump():
+
+    NMO_Neuron_Article = db.NMO_Neuron_Article
+    NMO_Neuron_Article.drop()
+
+    dump_dir = '/nmo/tables_dump'
+    if not os.path.exists(dump_dir):
+       os.makedirs(dump_dir)
+
+    os.chdir(dump_dir)
+
+    sql_file = 'neuron_article.sql'
+    if not os.path.exists(sql_file):
+        print(f"File {sql_file} does not exist.")
+    else:
+        print(f"File {sql_file} exists.")
+
+    try:
+        # Read the SQL dump file
+        with open(sql_file, 'r') as sql_file:
+            queries  = sql_file.read()
+
+        # Process and insert data into MongoDB
+        data = []
+        insert_pattern = re.compile(r"INSERT INTO `neuron_article` VALUES \((.*?)\);", re.MULTILINE | re.DOTALL)
+        insert_matches = re.findall(insert_pattern, queries)
+
+        for insert_match in insert_matches:
+            records = insert_match.split("),")
+            for record in records:
+                values = [int(v) if v.isdigit() else v.strip("'") if v != "NULL" else None for v in record.split(",")]
+
+                # Remove open parenthesis from index_id if it exists
+                if str(values[0]).find('(') == 0:
+                    values[0] = values[0].replace('(', '')
+
+                datum = {
+                    'neuron_id': int(values[0]),
+                    'article_id': values[1],
+                    'PMID': values[2],
+                    'id': values[3]
+                }
+                data.append(datum)
+
+        result = NMO_Neuron_Article.insert_many(data)
+        if result.acknowledged:
+            response_data = {'message': 'Data imported successfully'}
+            response = make_response(jsonify(response_data))
+            response.status_code = 200
+            return response
+        else:
+            response_data = {'error': 'Data import failed'}
+            return jsonify(response_data), 500
+
+    except Exception as e:
+        print('An error occurred:', str(e))
+        return abort(500, description='An error occurred')
+
+@app.route('/users/import_logdownload_dump', methods=['POST'])
+def import_logdownload_dump():
+
+    NMO_Log_Download = db.NMO_Log_Download
+    NMO_Log_Download.drop()
+
+    dump_dir = '/nmo/tables_dump'
+    if not os.path.exists(dump_dir):
+       os.makedirs(dump_dir)
+
+    os.chdir(dump_dir)
+
+    sql_file = 'logdownload.sql'
+    if not os.path.exists(sql_file):
+        print(f"File {sql_file} does not exist.")
+    else:
+        print(f"File {sql_file} exists.")
+
+    with open(sql_file, 'r', encoding='utf-8') as file:
+      try:
+        insert_pattern = re.compile(r"INSERT INTO `logdownload` VALUES (.*?);", re.MULTILINE | re.DOTALL)
+
+        batch_size = 1000
+
+        records_to_insert = []
+
+        for line in file:
+            insert_matches = re.findall(insert_pattern, line)
+
+            for insert_match in insert_matches:
+                records = insert_match.split("),")
+                for record in records:
+                    values = [v.strip("'") if v != "NULL" else None for v in re.split(r",(?![^(]*\))", record)]
+
+                    if len(values) >= 11:
+                        columns_to_keep_as_strings = [1, 2, 3, 4, 10]
+                        for col_index in columns_to_keep_as_strings:
+                            if values[col_index] is not None:
+                                values[col_index] = str(values[col_index])
+
+                        for i in range(11):
+                            if i not in columns_to_keep_as_strings and values[i] is not None:
+                                values[i] = int(values[i]) if values[i].isdigit() else values[i]
+
+                        if str(values[0]).find('(') == 0:
+                            values[0] = values[0].replace('(', '')
+
+                        records_to_insert.append({
+                            'index_id': int(values[0]),
+                            'ipaddress': str(values[1]),
+                            'DateVisited': str(values[2]),
+                            'Neuronname': str(values[4]),
+                            'neuron_id': int(values[10])
+                        })
+
+                        if len(records_to_insert) >= batch_size:
+                            NMO_Log_Download.insert_many(records_to_insert)
+                            records_to_insert = []
+
+        if records_to_insert:
+            NMO_Log_Download.insert_many(records_to_insert)
+
+        return make_response(jsonify({'message': 'Data imported successfully'}), 200)
+
+
+      except Exception as e:
+        print('An error occurred:', str(e))
+        return make_response(jsonify({'error': 'Data import failed'}), 500)
+
+
+
+@app.route('/users/article_neuron_download', methods=['POST'])
+def article_neuron_dowload():
+
+    response = Response(status=200)
+
+    NMO_Neuron_Article = db.NMO_Neuron_Article
+    NMO_Log_Download = db.NMO_Log_Download
+    NMO_Neuron_distinct_pmids = db.NMO_Neuron_distinct_pmids
+    NMO_Neuron_distinct_pmids.drop()
+    NMO_Neuron_distinct_downloads = db.NMO_Neuron_distinct_downloads
+    NMO_Neuron_distinct_downloads.drop()
+
+    db.create_collection('NMO_Neuron_distinct_pmids')
+    # Use the aggregation framework to group by PMID and insert into the new collection
+    pipeline1 = [
+        {
+            '$group': {
+                '_id': '$PMID',
+                'neuron_ids': {'$push': '$neuron_id'},
+                'article_id': {'$addToSet': '$article_id'}
+            }
+        },
+        {
+            '$out': 'NMO_Neuron_distinct_pmids'
+        }
+    ]
+
+    db.NMO_Neuron_Article.aggregate(pipeline1)
+
+    db.create_collection('NMO_Neuron_distinct_downloads')
+    # Use the aggregation framework to group by neuron_id and accumulate unique values
+    pipeline2 = [
+        {
+            '$group': {
+                '_id': '$neuron_id',
+                'DateVisited': {'$push': '$DateVisited'},
+                'Neuronname': {'$addToSet': '$Neuronname'},
+                'count_DateVisited': {'$sum': 1}  # Count DateVisited
+            }
+        },
+        {
+            '$out': 'NMO_Neuron_distinct_downloads'
+        }
+    ]
+
+    db.NMO_Log_Download.aggregate(pipeline2, allowDiskUse=True)
+
+    return make_response(jsonify({'message': 'Collection created successfully'}), 200)
+
+
+@app.route('/users/number_of_downloads_per_artcle', methods=['POST'])
+def number_of_downloads_per_article():
+
+    response = Response(status=200)
+
+    NMO_Neuron_distinct_pmids = db.NMO_Neuron_distinct_pmids
+    NMO_Neuron_distinct_downloads = db.NMO_Neuron_distinct_downloads
+    NMO_Number_of_downloads_per_pmid = db.NMO_Number_of_downloads_per_pmid
+    NMO_Number_of_downloads_per_pmid.drop()
+
+    article_docs = NMO_Neuron_distinct_pmids.find()
+    for doc1 in article_docs:
+        neuron_downloads = []
+        num_Neurons = 0
+        neuron_id_total_downloads = 0
+        avgDownloadsPerCell = 0
+        for elem in doc1['neuron_ids']:
+            res = NMO_Neuron_distinct_downloads.find_one({'_id' : elem})
+
+            if res != None:
+                num_Neurons += 1
+                neuron_downloads_Obj = {}
+                neuron_id_downloads = res['count_DateVisited']
+                neuron_id_total_downloads += neuron_id_downloads
+                neuron_downloads_Obj = {'neuron_id': elem, 'num_downloads': neuron_id_downloads}
+                neuron_downloads.append(neuron_downloads_Obj)
+
+        if len(neuron_downloads) != 0:
+                  avgDownloadsPerCell = round(neuron_id_total_downloads / num_Neurons)
+                  new_rec_id = NMO_Number_of_downloads_per_pmid.insert_one({
+                                    'pmid': doc1['_id'],
+                                    'num_downloads' : neuron_downloads,
+                                    'neuron_total_downloads' : neuron_id_total_downloads,
+                                    'avgDownloadsPerCell' : avgDownloadsPerCell
+                                })
+
+
+    return make_response(jsonify({'message': 'Collection created successfully'}), 200)
+
+
+@app.route('/users/NMODescribing_All_CitedBy_NMO_With_Downloads', methods=['POST'])
+def NMODescribing_All_CitedBy_NMO_With_Downloads():
+
+    response = Response(status=200)
+
+    NMODescribing_Overall_CitedByNMO = db.NMODescribing_Overall_CitedByNMO
+    NMO_Number_of_downloads_per_pmid = db.NMO_Number_of_downloads_per_pmid
+    NMODescribing_Overall_CitedByNMO_With_Downloads = db.NMODescribing_Overall_CitedByNMO_With_Downloads
+    NMODescribing_Overall_CitedByNMO_With_Downloads.drop()
+
+    docs1 = NMODescribing_Overall_CitedByNMO.find()
+    for doc1 in docs1:
+        new_rec_id = NMODescribing_Overall_CitedByNMO_With_Downloads.insert_one({
+                               'pmid': doc1['pmid'],
+                               'doi' : doc1['doi'],
+                               'citedBy': doc1['citedBy'],
+                               'title': doc1['title'],
+                               'publishedDate': doc1['publishedDate'],
+                               'total_NMO_Citations': doc1['total_NMO_Citations'],
+                               'Number_of_Downloads': None,
+                               'Avg_Downloads_Per_Cell': None
+                               })
+
+    for doc2 in NMO_Number_of_downloads_per_pmid.find():
+        NMODescribing_Overall_CitedByNMO_With_Downloads.update_one({"pmid": str(doc2["pmid"])}, { "$set":
+                                                                                                 {"Number_of_Downloads": doc2['neuron_total_downloads'],
+
+                                                                                                  "Avg_Downloads_Per_Cell": doc2['avgDownloadsPerCell']} })
+
+
+    return make_response(jsonify({'message': 'Creation created successfully'}), 200)
+
+
+@app.route('/users/NMO_DescribingCited_With_Downloads', methods=['POST'])
+def NMO_DescribingCited_With_Downloads():
+
+    response = Response(status=200)
+
+    NMO_DescribingCited = db.NMO_DescribingCited
+    NMO_Number_of_downloads_per_pmid = db.NMO_Number_of_downloads_per_pmid
+    NMO_DescribingCited_With_Downloads = db.NMO_DescribingCited_With_Downloads
+    NMO_DescribingCited_With_Downloads.drop()
+
+    docs1 = NMO_DescribingCited.find()
+    for doc1 in docs1:
+        new_rec_id = NMO_DescribingCited_With_Downloads.insert_one({
+                                                'doi': doc1['doi'],
+                                                'pmid': doc1['pmid'],
+                                                'title': doc1['title'],
+                                                'publishedDate': doc1['publishedDate'],
+                                                'Number_of_Downloads': None,
+                                                'Avg_Downloads_Per_Cell': None
+                                                })
+
+    for doc2 in NMO_Number_of_downloads_per_pmid.find():
+        id = str(doc2['pmid']) + str(' *')
+        NMO_DescribingCited_With_Downloads.update_one({"pmid": id}, { "$set":
+                                                                    { "Number_of_Downloads": doc2['neuron_total_downloads'],
+                                                                      "Avg_Downloads_Per_Cell": doc2['avgDownloadsPerCell']} })
+
+    return make_response(jsonify({'message': 'Collection created successfully'}), 200)
 
 
 if __name__ == '__main__':
